@@ -141,6 +141,7 @@ class WarpProxyHandler:
                 return False
 
             old_email = self.active_email
+            print(f"📧 Found active account: {email}")
 
             current_time = int(time.time() * 1000)
             token_expiry = account_data['stsTokenManager']['expirationTime']
@@ -148,9 +149,12 @@ class WarpProxyHandler:
             if isinstance(token_expiry, str):
                 token_expiry = int(token_expiry)
 
+            print(f"🕑 Token expiry: {token_expiry}, Current: {current_time}")
+            print(f"🕑 Time until expiry: {(token_expiry - current_time) // 1000} seconds")
+
             # If less than 1 minute left until token expires, refresh
             if current_time >= (token_expiry - 60000):  # 1 minute = 60000ms
-                print(f"Refreshing token: {email}")
+                print(f"🔄 Token expiring soon, refreshing: {email}")
                 if self.refresh_token(email, account_data):
                     # Get updated data
                     email, account_data = self.get_active_account()
@@ -158,8 +162,10 @@ class WarpProxyHandler:
                         self.active_token = account_data['stsTokenManager']['accessToken']
                         self.token_expiry = account_data['stsTokenManager']['expirationTime']
                         self.active_email = email
-                        print(f"Token refreshed: {email}")
+                        print(f"✅ Token refreshed: {email}")
                         return True
+                else:
+                    print(f"❌ Failed to refresh token for: {email}")
                 return False
             else:
                 self.active_token = account_data['stsTokenManager']['accessToken']
@@ -170,9 +176,13 @@ class WarpProxyHandler:
                     print(f"🔄 Active account changed: {old_email} → {email}")
                 else:
                     print(f"✅ Token active: {email}")
+                    
+                print(f"🔑 Token loaded: {self.active_token[:30] if self.active_token else 'None'}...")
                 return True
         except Exception as e:
-            print(f"Token update error: {e}")
+            print(f"❌ Token update error: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def check_account_change_trigger(self):
@@ -328,8 +338,80 @@ class WarpProxyHandler:
         print("🔄 Reloading user_settings.json...")
         return self.load_user_settings()
 
+# Глобальные переменные для отладки
+DEBUG_LOG_FILE = "proxy_debug.log"
+DEBUG_ALL_REQUESTS = True  # Включить логирование всех запросов
+REQUEST_COUNTER = 0
+LAST_WARP_REQUEST_TIME = 0
+
 # Global handler instance
 handler = WarpProxyHandler()
+
+def debug_log_all_requests(flow: http.HTTPFlow):
+    """Логирование всех запросов для отладки"""
+    global REQUEST_COUNTER, LAST_WARP_REQUEST_TIME
+    
+    if not DEBUG_ALL_REQUESTS:
+        return
+        
+    REQUEST_COUNTER += 1
+    current_time = time.time()
+    
+    # Определяем тип запроса
+    is_warp_related = any(domain in flow.request.pretty_host for domain in [
+        "app.warp.dev", "warp.dev", "dataplane.rudderstack.com", 
+        "identitytoolkit.googleapis.com", "securetoken.googleapis.com"
+    ])
+    
+    if is_warp_related:
+        LAST_WARP_REQUEST_TIME = current_time
+    
+    # Форматируем отладочную информацию
+    debug_info = {
+        "counter": REQUEST_COUNTER,
+        "timestamp": time.strftime("%H:%M:%S", time.localtime(current_time)),
+        "method": flow.request.method,
+        "host": flow.request.pretty_host,
+        "path": flow.request.path,
+        "url": flow.request.pretty_url,
+        "is_warp_related": is_warp_related,
+        "headers": dict(flow.request.headers),
+        "user_agent": flow.request.headers.get("User-Agent", "None"),
+        "authorization": flow.request.headers.get("Authorization", "None")[:50] + "..." if flow.request.headers.get("Authorization") else "None"
+    }
+    
+    # Выводим краткую информацию в консоль
+    if is_warp_related:
+        print(f"\n🔍 DEBUG #{REQUEST_COUNTER} - WARP REQUEST DETECTED!")
+        print(f"   🕐 Time: {debug_info['timestamp']}")
+        print(f"   🌐 {debug_info['method']} {debug_info['host']}{debug_info['path']}")
+        print(f"   🔑 Auth: {debug_info['authorization']}")
+        print(f"   🤖 UA: {debug_info['user_agent'][:100]}")
+    else:
+        # Логируем только счетчик для обычных запросов
+        if REQUEST_COUNTER % 10 == 0:  # Каждый 10-й запрос
+            print(f"📊 DEBUG: Processed {REQUEST_COUNTER} requests, last Warp request: {int(current_time - LAST_WARP_REQUEST_TIME)}s ago")
+    
+    # Записываем полную информацию в файл
+    try:
+        with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{json.dumps(debug_info, ensure_ascii=False)}\n")
+    except Exception as e:
+        print(f"⚠️ Debug log write error: {e}")
+
+def debug_get_statistics():
+    """Получить статистику отладки"""
+    global REQUEST_COUNTER, LAST_WARP_REQUEST_TIME
+    current_time = time.time()
+    
+    stats = {
+        "total_requests": REQUEST_COUNTER,
+        "last_warp_request_ago": int(current_time - LAST_WARP_REQUEST_TIME) if LAST_WARP_REQUEST_TIME > 0 else "Never",
+        "proxy_running_since": time.strftime("%H:%M:%S", time.localtime(current_time - (current_time % 3600))),
+        "debug_log_file": DEBUG_LOG_FILE
+    }
+    
+    return stats
 
 def is_relevant_request(flow: http.HTTPFlow) -> bool:
     """Check if this request is relevant to us"""
@@ -357,7 +439,21 @@ def is_relevant_request(flow: http.HTTPFlow) -> bool:
 
 def request(flow: http.HTTPFlow) -> None:
     """Executed when request is intercepted"""
-
+    
+    # РАСШИРЕННАЯ ОТЛАДКА - логируем ВСЕ запросы для диагностики
+    debug_log_all_requests(flow)
+    
+    # КРИТИЧЕСКИ ВАЖНО: Проверяем ВСЕ запросы к Warp доменам
+    is_warp_request = any(domain in flow.request.pretty_host for domain in [
+        "app.warp.dev", "warp.dev", "securetoken.googleapis.com", "identitytoolkit.googleapis.com"
+    ])
+    
+    if is_warp_request:
+        print(f"\n🎯 WARP REQUEST INTERCEPTED: {flow.request.method} {flow.request.pretty_url}")
+        print(f"   🌐 Host: {flow.request.pretty_host}")
+        print(f"   📍 Path: {flow.request.path}")
+        print(f"   🔑 Current Auth: {flow.request.headers.get('Authorization', 'None')[:50]}...")
+    
     # Immediately filter unimportant requests - pass silently (don't interfere with internet access)
     if not is_relevant_request(flow):
         # Directly pass all traffic not related to Warp
@@ -375,7 +471,7 @@ def request(flow: http.HTTPFlow) -> None:
         )
         return
 
-    print(f"🌐 Warp Request: {flow.request.method} {flow.request.pretty_url}")
+    print(f"🌐 Processing Warp Request: {flow.request.method} {flow.request.pretty_url}")
 
     # Detect CreateGenericStringObject request - trigger user_settings.json update
     if ("/graphql/v2?op=CreateGenericStringObject" in request_url and
@@ -387,43 +483,49 @@ def request(flow: http.HTTPFlow) -> None:
     if handler.check_account_change_trigger():
         print("🔄 Trigger detected and token updated!")
 
-    # Show active account information
-    print(f"📧 Current active account: {handler.active_email}")
-
-    # Check token every minute
+    # ОБЯЗАТЕЛЬНО проверяем активный аккаунт при каждом запросе
     current_time = time.time()
-    if current_time - handler.last_token_check > 60:  # 60 seconds
-        print("⏰ Time for token check, updating...")
+    if current_time - handler.last_token_check > 30:  # Проверяем каждые 30 секунд (было 60)
+        print("⏰ Regular token check...")
         handler.update_active_token()
         handler.last_token_check = current_time
 
     # Check active account
     if not handler.active_email:
-        print("❓ No active account found, checking token...")
+        print("❌ No active account found, updating...")
         handler.update_active_token()
 
-    # Modify Authorization header
+    # Show active account information
+    print(f"📧 Current active account: {handler.active_email}")
+    print(f"🔑 Token available: {handler.active_token is not None}")
+
+    # Modify Authorization header - КРИТИЧЕСКИ ВАЖНО!
     if handler.active_token:
         old_auth = flow.request.headers.get("Authorization", "None")
         new_auth = f"Bearer {handler.active_token}"
+        
+        # ВСЕГДА заменяем заголовок авторизации
         flow.request.headers["Authorization"] = new_auth
 
-        print(f"🔑 Authorization header updated: {handler.active_email}")
+        print(f"🔑 Authorization header MODIFIED for: {handler.active_email}")
+        print(f"   📝 Old: {old_auth[:50]}...")
+        print(f"   📝 New: {new_auth[:50]}...")
 
         # Check if tokens are actually different
         if old_auth == new_auth:
             print("   ⚠️  WARNING: Old and new tokens are IDENTICAL!")
         else:
-            print("   ✅ Token successfully changed")
+            print("   ✅ Token successfully REPLACED")
 
         # Also show token ending
         if len(handler.active_token) > 100:
-            print(f"   Token ending: ...{handler.active_token[-20:]}")
+            print(f"   🎯 Token ending: ...{handler.active_token[-20:]}")
 
     else:
-        print("❌ ACTIVE TOKEN NOT FOUND - HEADER NOT MODIFIED!")
-        print(f"   Active email: {handler.active_email}")
-        print(f"   Token status: {handler.active_token is not None}")
+        print("❌ CRITICAL: ACTIVE TOKEN NOT FOUND - HEADER NOT MODIFIED!")
+        print(f"   📧 Active email: {handler.active_email}")
+        print(f"   🔑 Token status: {handler.active_token is not None}")
+        print("   💡 Make sure to activate an account in the UI!")
 
     # For all app.warp.dev requests check and randomize x-warp-experiment-id header
     if "app.warp.dev" in flow.request.pretty_host:
@@ -433,8 +535,10 @@ def request(flow: http.HTTPFlow) -> None:
         flow.request.headers["x-warp-experiment-id"] = new_experiment_id
         
         print(f"🧪 Experiment ID changed ({flow.request.path}):")
-        print(f"   Old: {old_experiment_id}")
-        print(f"   New: {new_experiment_id}")
+        print(f"   📝 Old: {old_experiment_id}")
+        print(f"   📝 New: {new_experiment_id}")
+        
+    print(f"✅ Request processing completed for: {flow.request.pretty_url}")
 
 def responseheaders(flow: http.HTTPFlow) -> None:
     """Executed when response headers are received - controls streaming"""
@@ -508,19 +612,78 @@ def response(flow: http.HTTPFlow) -> None:
 # Load active account on startup
 def load(loader):
     """Executed when script starts"""
-    print("Warp Proxy Script started")
+    print("\n" + "="*60)
+    print("🚀 WARP PROXY SCRIPT STARTED - ENHANCED DEBUG MODE")
+    print("="*60)
+    
+    # Инициализация отладочного файла
+    try:
+        with open(DEBUG_LOG_FILE, "w", encoding="utf-8") as f:
+            f.write(f"# Proxy Debug Log Started at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        print(f"📝 Debug log initialized: {DEBUG_LOG_FILE}")
+    except Exception as e:
+        print(f"⚠️ Failed to initialize debug log: {e}")
+    
+    print("\n🔍 DIAGNOSTIC INFORMATION:")
+    print("-" * 40)
+    
+    # Проверка системы
+    import sys
+    import os
+    print(f"🐍 Python: {sys.version[:20]}...")
+    print(f"💻 Platform: {sys.platform}")
+    print(f"📂 Working directory: {os.getcwd()}")
+    print(f"🌐 Debug mode: {DEBUG_ALL_REQUESTS}")
+    
+    print("\n📧 ACCOUNT STATUS:")
+    print("-" * 20)
     print("Checking database connection...")
     handler.update_active_token()
     if handler.active_email:
-        print(f"Active account loaded: {handler.active_email}")
-        print(f"Token exists: {handler.active_token is not None}")
+        print(f"✅ Active account loaded: {handler.active_email}")
+        print(f"🔑 Token exists: {handler.active_token is not None}")
+        if handler.active_token:
+            print(f"🎯 Token preview: {handler.active_token[:30]}...")
     else:
-        print("No active account found - Don't forget to activate an account!")
+        print("❌ No active account found - Don't forget to activate an account!")
 
     # Load user_settings.json file
+    print("\n⚙️ USER SETTINGS:")
+    print("-" * 17)
     print("Loading user_settings.json file...")
     handler.load_user_settings()
+    
+    print("\n🎯 PROXY INTERCEPTION TARGETS:")
+    print("-" * 32)
+    print("✅ app.warp.dev (main target)")
+    print("🚫 dataplane.rudderstack.com (blocked)")
+    print("🔧 identitytoolkit.googleapis.com (auth)")
+    print("🔄 securetoken.googleapis.com (token refresh)")
+    
+    print("\n⚡ READY FOR INTERCEPTION!")
+    print("="*60)
+    print("Waiting for requests... (use Ctrl+C to stop)\n")
 
 def done():
     """Executed when script stops"""
-    print("Warp Proxy Script stopped")
+    print("\n" + "="*60)
+    print("🛑 WARP PROXY SCRIPT STOPPING")
+    print("="*60)
+    
+    # Показываем финальную статистику
+    stats = debug_get_statistics()
+    print(f"📊 FINAL STATISTICS:")
+    print(f"   Total requests processed: {stats['total_requests']}")
+    print(f"   Last Warp request: {stats['last_warp_request_ago']} seconds ago")
+    print(f"   Debug log saved to: {stats['debug_log_file']}")
+    
+    # Записываем финальную статистику в лог
+    try:
+        with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"\n# Script stopped at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"# Final statistics: {json.dumps(stats, ensure_ascii=False)}\n")
+    except Exception as e:
+        print(f"⚠️ Failed to write final stats: {e}")
+    
+    print("\n👋 Proxy script stopped successfully")
+    print("="*60)

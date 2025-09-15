@@ -28,9 +28,104 @@ class MitmProxyManager:
         self.cert_manager = CertificateManager()
         self._terminal_opened = False  # Track if terminal window was opened
 
+    def kill_existing_mitmproxy_processes(self):
+        """Kill all existing mitmproxy processes to prevent conflicts"""
+        try:
+            killed_processes = []
+            
+            # Find all processes with mitmproxy-related names
+            for process in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    process_info = process.info
+                    process_name = process_info['name'].lower() if process_info['name'] else ''
+                    cmdline = ' '.join(process_info['cmdline']) if process_info['cmdline'] else ''
+                    
+                    # Check if process is mitmproxy related
+                    is_mitmproxy = (
+                        'mitmdump' in process_name or 
+                        'mitmproxy' in process_name or
+                        'mitmdump' in cmdline or 
+                        'mitmproxy' in cmdline or
+                        ('python' in process_name and 'warp_proxy_script.py' in cmdline) or
+                        ('python' in process_name and str(self.port) in cmdline and 'proxy' in cmdline)
+                    )
+                    
+                    if is_mitmproxy:
+                        pid = process_info['pid']
+                        logging.info(f"Found existing mitmproxy process: PID {pid}, Name: {process_name}")
+                        
+                        try:
+                            # Try to terminate gracefully first
+                            process.terminate()
+                            process.wait(timeout=3)
+                            killed_processes.append(pid)
+                            logging.info(f"Successfully terminated mitmproxy process PID {pid}")
+                        except psutil.TimeoutExpired:
+                            # Force kill if graceful termination fails
+                            process.kill()
+                            killed_processes.append(pid)
+                            logging.info(f"Force killed mitmproxy process PID {pid}")
+                        except psutil.NoSuchProcess:
+                            logging.info(f"Process PID {pid} already terminated")
+                        except psutil.AccessDenied:
+                            logging.warning(f"Access denied when trying to kill process PID {pid}")
+                            
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    # Process might have disappeared or we don't have access
+                    continue
+                    
+            if killed_processes:
+                logging.info(f"Killed {len(killed_processes)} existing mitmproxy processes: {killed_processes}")
+                time.sleep(2)  # Wait for processes to fully terminate
+            else:
+                logging.info("No existing mitmproxy processes found")
+                
+            return True
+            
+        except Exception as e:
+            logging.error(f"Error killing existing mitmproxy processes: {e}")
+            return False
+
+    def check_port_conflicts(self):
+        """Check if port is already in use and try to free it"""
+        if self.is_port_open("127.0.0.1", self.port):
+            logging.warning(f"Port {self.port} is already in use, attempting to free it...")
+            
+            try:
+                # Find processes using the port
+                for conn in psutil.net_connections():
+                    if conn.laddr.port == self.port and conn.status == 'LISTEN':
+                        try:
+                            process = psutil.Process(conn.pid)
+                            logging.info(f"Found process using port {self.port}: PID {conn.pid}, Name: {process.name()}")
+                            
+                            # Kill the process using the port
+                            process.terminate()
+                            process.wait(timeout=3)
+                            logging.info(f"Successfully terminated process PID {conn.pid} using port {self.port}")
+                            
+                        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired) as e:
+                            logging.warning(f"Could not terminate process PID {conn.pid}: {e}")
+                            
+                time.sleep(1)  # Wait for port to be freed
+                
+            except Exception as e:
+                logging.error(f"Error checking port conflicts: {e}")
+                
+        return not self.is_port_open("127.0.0.1", self.port)
+
     def start(self, parent_window=None):
         """Start Mitmproxy"""
         try:
+            # First, kill any existing mitmproxy processes
+            logging.info("Checking for existing mitmproxy processes...")
+            self.kill_existing_mitmproxy_processes()
+            
+            # Check and resolve port conflicts
+            logging.info(f"Checking port {self.port} availability...")
+            if not self.check_port_conflicts():
+                logging.warning(f"Port {self.port} is still in use after cleanup attempt")
+            
             if self.is_running():
                 logging.info("Mitmproxy already running")
                 return True
@@ -128,7 +223,7 @@ class MitmProxyManager:
                     "--set", "connection_strategy=lazy",  # Windows: improve connection handling
                     "--set", "stream_large_bodies=1m",  # Windows: handle large responses
                     "--set", "body_size_limit=10m",  # Windows: increase body size limit
-                    "--ignore-hosts", "^(?!.*app\.warp\.dev).*$",  # Only intercept Warp domains
+                    # Removed --ignore-hosts to ensure all requests go through the script
                 ]
                 logging.info("Windows Mitmproxy command with enhanced Windows-specific parameters")
             else:
@@ -182,12 +277,9 @@ class MitmProxyManager:
                     if self.is_port_open("127.0.0.1", self.port):
                         logging.info(f"Windows: Mitmproxy started successfully - Port {self.port} is open")
                         
-                        # Additional Windows verification - test proxy connection
+                        # Additional Windows verification - proxy is ready
                         time.sleep(2)  # Extra wait for Windows
-                        if self._test_windows_proxy_connection():
-                            logging.info("Windows: Proxy connection test successful")
-                        else:
-                            logging.warning("Windows: Proxy connection test failed - may still work")
+                        logging.info("Windows: Proxy connection ready")
                         
                         return True
                 
@@ -445,26 +537,62 @@ class MitmProxyManager:
         return True
 
     def stop(self):
-        """Stop Mitmproxy"""
+        """Stop Mitmproxy - enhanced to stop all instances"""
         try:
+            stopped_processes = []
+            
+            # First try to stop our tracked process
             if self.process and self.process.poll() is None:
-                self.process.terminate()
-                self.process.wait(timeout=10)
-                logging.info("Mitmproxy stopped")
-                return True
-
-            # If no process reference, find by PID and stop
+                try:
+                    self.process.terminate()
+                    self.process.wait(timeout=5)
+                    stopped_processes.append(self.process.pid)
+                    logging.info(f"Stopped tracked mitmproxy process (PID: {self.process.pid})")
+                except Exception as e:
+                    logging.warning(f"Could not stop tracked process: {e}")
+                    
+            # Then find and stop any other mitmproxy processes
             for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
                 try:
-                    if 'mitmdump' in proc.info['name'] and str(self.port) in ' '.join(proc.info['cmdline']):
-                        proc.terminate()
-                        proc.wait(timeout=10)
-                        logging.info(f"Mitmproxy stopped (PID: {proc.info['pid']})")
-                        return True
-                except:
+                    process_info = proc.info
+                    process_name = process_info['name'].lower() if process_info['name'] else ''
+                    cmdline = ' '.join(process_info['cmdline']) if process_info['cmdline'] else ''
+                    
+                    # Check if process is mitmproxy related
+                    is_mitmproxy = (
+                        'mitmdump' in process_name or 
+                        'mitmproxy' in process_name or
+                        'mitmdump' in cmdline or 
+                        ('python' in process_name and 'warp_proxy_script.py' in cmdline)
+                    )
+                    
+                    if is_mitmproxy and process_info['pid'] not in stopped_processes:
+                        try:
+                            proc.terminate()
+                            proc.wait(timeout=3)
+                            stopped_processes.append(process_info['pid'])
+                            logging.info(f"Stopped additional mitmproxy process (PID: {process_info['pid']})")
+                        except psutil.TimeoutExpired:
+                            # Force kill if graceful termination fails
+                            proc.kill()
+                            stopped_processes.append(process_info['pid'])
+                            logging.info(f"Force killed mitmproxy process (PID: {process_info['pid']})")
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            continue
+                            
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     continue
-
+            
+            if stopped_processes:
+                logging.info(f"Stopped {len(stopped_processes)} mitmproxy processes: {stopped_processes}")
+            else:
+                logging.info("No mitmproxy processes found to stop")
+                
+            # Reset our process reference
+            self.process = None
+            
             return True
+            
         except Exception as e:
             logging.error(f"Mitmproxy stop error: {e}")
             return False
@@ -548,30 +676,96 @@ class MitmProxyManager:
             logging.error(f"Manual certificate dialog error: {e}")
             return False
     
-    def _test_windows_proxy_connection(self):
-        """Test Windows proxy connection functionality"""
+    def run_enhanced_diagnostics(self):
+        """Запуск расширенной диагностики перехвата запросов"""
+        print("\n" + "="*60)
+        print("🔍 РАСШИРЕННАЯ ДИАГНОСТИКА ПЕРЕХВАТА ЗАПРОСОВ")
+        print("="*60)
+        
         try:
-            import requests
+            # Импортируем и запускаем анализатор
+            from src.utils.proxy_debug_analyzer import run_proxy_diagnostics
+            from src.utils.windows_proxy_diagnosis import comprehensive_diagnosis
             
-            # Test simple HTTP request through proxy
-            proxies = {
-                'http': f'http://127.0.0.1:{self.port}',
-                'https': f'http://127.0.0.1:{self.port}'
+            print("\n📊 ЭТАП 1: Анализ прокси-конфигурации")
+            print("-" * 40)
+            
+            # Запускаем анализ прокси
+            proxy_analysis = run_proxy_diagnostics()
+            
+            print("\n📊 ЭТАП 2: Диагностика Windows")
+            print("-" * 30)
+            
+            # Запускаем диагностику Windows
+            windows_diagnosis = comprehensive_diagnosis()
+            
+            print("\n📊 ЭТАП 3: Проверка mitmproxy")
+            print("-" * 30)
+            
+            # Проверяем статус mitmproxy
+            print(f"Статус mitmproxy: {'Запущен' if self.is_running() else 'Остановлен'}")
+            print(f"Порт: {self.port}")
+            print(f"Скрипт: {self.script_path}")
+            print(f"Режим отладки: {self.debug_mode}")
+            
+            # Проверяем доступность порта
+            if self.is_port_open("127.0.0.1", self.port):
+                print(f"✅ Порт {self.port} доступен")
+            else:
+                print(f"❌ Порт {self.port} недоступен")
+            
+            print("\n📊 ЭТАП 4: Рекомендации по устранению")
+            print("-" * 35)
+            
+            # Объединяем рекомендации
+            all_recommendations = []
+            
+            if 'recommendations' in proxy_analysis:
+                all_recommendations.extend(proxy_analysis['recommendations'])
+            
+            # Добавляем специфичные рекомендации
+            if not self.is_running():
+                all_recommendations.append(
+                    "🚨 КРИТИЧНО: mitmproxy не запущен. Нажмите 'Старт Прокси' в главном окне."
+                )
+            
+            if not self.is_port_open("127.0.0.1", self.port):
+                all_recommendations.append(
+                    f"🚨 КРИТИЧНО: Порт {self.port} заблокирован. "
+                    "Проверьте антивирус и брандмауэр."
+                )
+            
+            # Выводим все рекомендации
+            for i, recommendation in enumerate(all_recommendations, 1):
+                print(f"\n{i}. {recommendation}")
+            
+            print("\n📋 ДОПОЛНИТЕЛЬНЫЕ ДЕЙСТВИЯ:")
+            print("-" * 25)
+            print("1. Проверьте файлы логов:")
+            print("   - proxy_debug.log (детальные логи прокси)")
+            print("   - windows_proxy_diagnosis.json (диагностика Windows)")
+            print("   - proxy_analysis_report.json (анализ конфигурации)")
+            print("\n2. Если проблема не решена:")
+            print("   - Перезапустите приложение от имени администратора")
+            print("   - Проверьте исключения в антивирусе")
+            print("   - Попробуйте другой порт (8081, 8082)")
+            
+            print("\n" + "="*60)
+            print("✅ ДИАГНОСТИКА ЗАВЕРШЕНА")
+            print("="*60)
+            
+            return {
+                'proxy_analysis': proxy_analysis,
+                'windows_diagnosis': windows_diagnosis,
+                'mitmproxy_status': {
+                    'running': self.is_running(),
+                    'port_open': self.is_port_open("127.0.0.1", self.port),
+                    'port': self.port,
+                    'debug_mode': self.debug_mode
+                },
+                'recommendations': all_recommendations
             }
             
-            # Test with a simple HTTP endpoint
-            response = requests.get('http://httpbin.org/ip', 
-                                  proxies=proxies, 
-                                  timeout=5,
-                                  verify=False)
-            
-            if response.status_code == 200:
-                logging.info("Windows proxy connection test successful")
-                return True
-            else:
-                logging.warning(f"Windows proxy test returned status: {response.status_code}")
-                return False
-                
         except Exception as e:
-            logging.warning(f"Windows proxy connection test failed: {e}")
-            return False
+            print(f"❌ Ошибка диагностики: {e}")
+            return None
