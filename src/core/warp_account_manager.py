@@ -9,6 +9,7 @@ import subprocess
 import os
 import psutil
 import urllib3
+import logging
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
@@ -262,9 +263,9 @@ class MainWindow(QMainWindow):
         self.proxy_manager = MitmProxyManager()
         self.proxy_enabled = False
 
-        # If proxy is disabled, clear active account
-        if not ProxyManager.is_proxy_enabled():
-            self.account_manager.clear_active_account()
+        # Note: Do not clear active account on startup - let user manage manually
+        # if not ProxyManager.is_proxy_enabled():
+        #     self.account_manager.clear_active_account()
 
         self.init_ui()
         self.load_accounts()
@@ -296,6 +297,9 @@ class MainWindow(QMainWindow):
 
         # Run token check immediately on first startup
         QTimer.singleShot(0, self.auto_renew_tokens)
+        
+        # Sync UI with actual proxy state after all timers are initialized
+        QTimer.singleShot(1000, self.sync_ui_with_proxy_state)
 
         # Variables for token worker
         self.token_worker = None
@@ -377,8 +381,15 @@ class MainWindow(QMainWindow):
         self.help_button = QPushButton('Help')
         self.help_button.setFixedHeight(36)  # Compatible with modern button height
         self.help_button.setToolTip("Help and User Guide")
-        self.help_button.clicked.connect(self.show_help_dialog)
+        self.help_button.clicked.connect(self.show_help)
         button_layout.addWidget(self.help_button)
+        
+        # ОТЛАДОЧНАЯ КНОПКА ДЛЯ диагностики
+        self.debug_button = QPushButton('🔍 Debug')
+        self.debug_button.setFixedHeight(36)
+        self.debug_button.setToolTip("Запустить диагностику перехвата запросов")
+        self.debug_button.clicked.connect(self.run_debug_diagnostics)
+        button_layout.addWidget(self.debug_button)
 
         layout.addLayout(button_layout)
 
@@ -427,15 +438,16 @@ class MainWindow(QMainWindow):
             activation_button.setFixedSize(75, 20)  # Larger size to better fill cell
             activation_button.setObjectName("activationButton")
             
-            # Set button state
+            # Set button state based on actual proxy status
             is_active = (email == active_account)
             is_banned = (health_status == _('status_banned_key'))
+            proxy_actually_running = self.proxy_enabled and self.proxy_manager.is_running()
 
             if is_banned:
                 activation_button.setText(_('button_banned'))
                 activation_button.setProperty("state", "banned")
                 activation_button.setEnabled(False)
-            elif is_active:
+            elif is_active and proxy_actually_running:
                 activation_button.setText(_('button_stop'))
                 activation_button.setProperty("state", "stop")
             else:
@@ -523,11 +535,13 @@ class MainWindow(QMainWindow):
         else:
             # Account not active or proxy disabled - start proxy and activate account
             if not self.proxy_enabled:
-                # First start proxy
-                self.show_status_message(f"Starting proxy and activating {email}...", 2000)
+                # АВТОМАТИЧЕСКИ запускаем прокси при активации аккаунта
+                print(f"🚀 Auto-starting proxy for account activation: {email}")
+                self.show_status_message(f"Auto-starting proxy and activating {email}...", 2000)
                 if self.start_proxy_and_activate_account(email):
                     return  # Successful - operation completed
                 else:
+                    self.show_status_message(f"Failed to start proxy for {email}", 5000)
                     return  # Failed - error message already shown
             else:
                 # Proxy already active, just activate account
@@ -1659,6 +1673,49 @@ class MainWindow(QMainWindow):
             print(f"Token update error: {e}")
             return False
 
+    def sync_ui_with_proxy_state(self):
+        """Synchronize UI state with actual proxy status on startup"""
+        try:
+            # Check if mitmproxy is actually running
+            proxy_is_running = self.proxy_manager.is_running()
+            
+            if proxy_is_running:
+                # Proxy is running but self.proxy_enabled might be False
+                logging.info("Found running mitmproxy process, syncing UI state")
+                self.proxy_enabled = True
+                self.proxy_stop_button.setVisible(True)
+                self.proxy_stop_button.setEnabled(True)
+                self.proxy_start_button.setVisible(False)
+                
+                # Enable system proxy if it's not already enabled
+                if not ProxyManager.is_proxy_enabled():
+                    ProxyManager.enable_proxy(self.proxy_manager.get_proxy_url())
+                    
+                # Start the active account refresh timer if it exists
+                if hasattr(self, 'active_account_refresh_timer') and not self.active_account_refresh_timer.isActive():
+                    self.active_account_refresh_timer.start(60000)
+                    
+                self.status_bar.showMessage("Proxy is running", 3000)
+            else:
+                # No proxy running, ensure UI reflects this
+                self.proxy_enabled = False
+                self.proxy_stop_button.setVisible(False)
+                self.proxy_stop_button.setEnabled(False)
+                self.proxy_start_button.setVisible(False)  # Start button is hidden by design
+                
+                # Disable system proxy
+                ProxyManager.disable_proxy()
+                
+                # Stop the active account refresh timer if it's running
+                if hasattr(self, 'active_account_refresh_timer') and self.active_account_refresh_timer.isActive():
+                    self.active_account_refresh_timer.stop()
+                    
+            # Reload accounts to reflect correct button states
+            self.load_accounts(preserve_limits=True)
+            
+        except Exception as e:
+            logging.error(f"Error syncing UI with proxy state: {e}")
+
     def check_proxy_status(self):
         """Check proxy status"""
         if self.proxy_enabled:
@@ -2018,7 +2075,61 @@ class MainWindow(QMainWindow):
         if timeout > 0:
             self.status_reset_timer.start(timeout)
 
-    def show_help_dialog(self):
+    def run_debug_diagnostics(self):
+        """Запуск диагностики перехвата"""
+        try:
+            print("⚡ Запуск диагностики перехвата...")
+            
+            # Показываем сообщение
+            self.status_bar.showMessage("🔍 Запуск диагностики...", 2000)
+            
+            # 1. Проверяем базовые компоненты
+            print("\n🔍 ПРОВЕРКА КОМПОНЕНТОВ:")
+            print(f"- mitmproxy запущен: {self.proxy_manager.is_running()}")
+            print(f"- Порт 8080 открыт: {self.proxy_manager.is_port_open('127.0.0.1', 8080)}")
+            print(f"- Системный прокси: {ProxyManager.is_proxy_enabled()}")
+            print(f"- Активный аккаунт: {self.account_manager.get_active_account()}")
+            
+            # 2. Запускаем быстрый тест
+            from src.utils.quick_proxy_test import quick_proxy_test
+            print("\n🚀 БЫСТРЫЙ ТЕСТ:")
+            quick_results = quick_proxy_test()
+            
+            # 3. Показываем результаты
+            problems = []
+            if quick_results.get("tests", {}).get("port_8080") != "OPEN":
+                problems.append("❌ Порт 8080 недоступен")
+            
+            if quick_results.get("tests", {}).get("mitmproxy_process") != "FOUND":
+                problems.append("❌ mitmproxy не запущен")
+            
+            if quick_results.get("tests", {}).get("system_proxy") == "DISABLED":
+                problems.append("❌ Системный прокси отключен")
+            
+            # 4. Показываем результат
+            if problems:
+                problem_text = "\n".join(problems)
+                print(f"\n🚨 ОБНАРУЖЕНЫ ПРОБЛЕМЫ:\n{problem_text}")
+                
+                # Показываем быстрые решения
+                print("\n🛠️ БЫСТРЫЕ РЕШЕНИЯ:")
+                if "Порт 8080" in problem_text:
+                    print("1. Нажмите кнопку Start на аккаунте для запуска прокси")
+                if "прокси отключен" in problem_text:
+                    print("2. Прокси будет включен автоматически при запуске")
+                
+                self.status_bar.showMessage(f"🚨 Обнаружено {len(problems)} проблем - см. консоль", 8000)
+            else:
+                print("\n✅ ВСЕ КОМПОНЕНТЫ РАБОТАЮТ!")
+                self.status_bar.showMessage("✅ Диагностика: все компоненты работают", 5000)
+            
+            print("\n📋 Подробные результаты сохранены в quick_test_results.json")
+            
+        except Exception as e:
+            print(f"❌ Ошибка диагностики: {e}")
+            self.status_bar.showMessage(f"❌ Ошибка диагностики: {e}", 5000)
+    
+    def show_help(self):
         """Open Telegram for help"""
         import webbrowser
         webbrowser.open("https://t.me/warp_account_manager_help")
